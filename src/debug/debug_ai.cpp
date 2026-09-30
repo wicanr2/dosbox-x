@@ -304,6 +304,7 @@ enum class AIMethod {
     DebugStatus, CpuGet, MemoryRead, CodeCurrent, CodeDisassemble,
     MemoryWrite, RegisterWrite,
     BreakpointSet, BreakpointDelete, BreakpointList,
+    BreakpointSetMemory, BreakpointSetInterrupt, BreakpointSetLog,
     ExecutionContinue,
     ExecutionStepInto, ExecutionStepOver
 };
@@ -320,7 +321,35 @@ struct AIRequestItem {
     std::string regName;              /* register.write -- already whitelist-checked */
     uint32_t regValue = 0;            /* register.write */
     long long breakpointIndex = -1;   /* breakpoint.delete */
+    bool linear = false;              /* breakpoint.set_memory: address is linear */
+    long long memLength = 1;          /* breakpoint.set_memory */
+    uint8_t intNr = 0;                /* breakpoint.set_interrupt */
+    uint16_t ah = 0x100, al = 0x100;  /* breakpoint.set_interrupt; 0x100 = any (BPINT_ALL) */
+    int stackWords = 0;               /* breakpoint.set_log */
 };
+
+/* Phase 6 state (docs/phase6-watch-int-log-breakpoints.md).
+ *
+ * g_memHit is written by DEBUG_AI_NoteMemoryHit() on the emulator thread and
+ * read by ExecDebugStatus() on the same thread, so it needs no lock.
+ * g_logBreakpoints is only touched on the emulator thread (Exec* and Poll).
+ * g_logEntries is appended on the emulator thread and drained by log.read on
+ * the socket thread, hence g_logMutex. */
+struct AIMemHit {
+    bool valid = false;
+    bool isLinear = false;
+    uint16_t seg = 0;
+    uint32_t off = 0;
+    uint32_t linear = 0;
+    uint8_t oldValue = 0, newValue = 0;
+};
+static AIMemHit g_memHit;
+static std::map<uint32_t, int> g_logBreakpoints;   /* physical address -> stack words */
+static const size_t MAX_LOG_ENTRIES = 4096;
+static std::mutex g_logMutex;
+static std::deque<std::string> g_logEntries;
+static unsigned long long g_logSeq = 0;
+static unsigned long long g_logDropped = 0;
 
 static std::atomic<bool> g_bridgeRunning{false};
 static ai_socket_t       g_listenSocket = AI_INVALID_SOCKET;
@@ -488,6 +517,21 @@ static std::string ExecDebugStatus(long long id) {
      * fast path in HandleLine() for when it is NOT. */
     bool stopped = !DEBUG_AI_IsDebugRunning();
 
+    /* Phase 6: which memory breakpoint stopped us, until the next continue. */
+    char memHit[192];
+    memHit[0] = 0;
+    if (g_memHit.valid) {
+        if (g_memHit.isLinear)
+            snprintf(memHit, sizeof(memHit),
+                ",\"last_memory_hit\":{\"linear\":\"%05X\",\"old\":\"%02X\",\"new\":\"%02X\"}",
+                (unsigned)g_memHit.linear, (unsigned)g_memHit.oldValue, (unsigned)g_memHit.newValue);
+        else
+            snprintf(memHit, sizeof(memHit),
+                ",\"last_memory_hit\":{\"address\":\"%04X:%04X\",\"linear\":\"%05X\",\"old\":\"%02X\",\"new\":\"%02X\"}",
+                (unsigned)g_memHit.seg, (unsigned)(g_memHit.off & 0xFFFF), (unsigned)g_memHit.linear,
+                (unsigned)g_memHit.oldValue, (unsigned)g_memHit.newValue);
+    }
+
     char buf[2048];
     snprintf(buf, sizeof(buf),
         "{\"id\":%lld,\"ok\":true,\"result\":{"
@@ -498,6 +542,7 @@ static std::string ExecDebugStatus(long long id) {
         "\"registers\":%s,"
         "\"segments\":%s,"
         "\"flags\":{\"eflags\":\"%08X\"}"
+        "%s"
         "}}",
         id,
         stopped ? "true" : "false",
@@ -506,7 +551,7 @@ static std::string ExecDebugStatus(long long id) {
         bytesHex.c_str(), JsonEscape(dline).c_str(),
         BuildRegistersJson().c_str(),
         BuildSegmentsJson().c_str(),
-        (unsigned)reg_flags);
+        (unsigned)reg_flags, memHit);
     return std::string(buf);
 }
 
@@ -577,6 +622,7 @@ void DEBUG_AI_CompletePendingSteps(void) {
  * return success" -- the resume is real and already in effect, just not
  * separately re-verified inside this response the way pause's response is. */
 static std::string ExecExecutionContinue(long long id) {
+    g_memHit.valid = false;  /* Phase 6: the hit belongs to this stop only */
     DEBUG_AI_DoContinue();
     char buf[128];
     snprintf(buf, sizeof(buf),
@@ -797,6 +843,14 @@ static std::string ExecBreakpointSet(long long id, uint16_t seg, uint32_t off) {
 }
 
 static std::string ExecBreakpointDelete(long long id, long long index) {
+    /* Phase 6: a logging breakpoint is a physical breakpoint plus an entry
+     * in g_logBreakpoints -- drop the entry with the breakpoint. */
+    if (index >= 0 && index <= 0xFFFF) {
+        int type = 0; uint16_t seg = 0, ah = 0, al = 0; uint32_t off = 0; uint8_t intNr = 0;
+        if (DEBUG_AI_BreakpointDetail((uint16_t)index, type, seg, off, intNr, ah, al) &&
+            type == DEBUG_AI_BP_PHYSICAL)
+            g_logBreakpoints.erase((uint32_t)GetAddress(seg, off));
+    }
     bool ok = (index >= 0 && index <= 0xFFFF) && DEBUG_AI_BreakpointDelete((uint16_t)index);
     if (!ok) {
         char buf[256];
@@ -822,15 +876,38 @@ static std::string ExecBreakpointList(long long id) {
     std::string arr = "[";
     bool first = true;
     for (uint16_t i = 0; i < count; i++) {
-        bool isPhysical = false;
-        uint16_t seg = 0;
+        /* Phase 6: every type, tagged. Physical ones keep the Phase 4B shape. */
+        int type = 0;
+        uint16_t seg = 0, ah = 0, al = 0;
         uint32_t off = 0;
-        if (!DEBUG_AI_BreakpointInfo(i, isPhysical, seg, off)) continue;
-        if (!isPhysical) continue;  /* interrupt/memory breakpoints: out of scope for Phase 4B */
+        uint8_t intNr = 0;
+        if (!DEBUG_AI_BreakpointDetail(i, type, seg, off, intNr, ah, al)) continue;
 
-        char item[128];
-        snprintf(item, sizeof(item), "%s{\"id\":%u,\"address\":\"%04X:%04X\",\"enabled\":true}",
-            first ? "" : ",", (unsigned)i, (unsigned)seg, (unsigned)(off & 0xFFFF));
+        char item[256];
+        if (type == DEBUG_AI_BP_PHYSICAL) {
+            auto it = g_logBreakpoints.find((uint32_t)GetAddress(seg, off));
+            if (it == g_logBreakpoints.end())
+                snprintf(item, sizeof(item), "%s{\"id\":%u,\"type\":\"physical\",\"address\":\"%04X:%04X\",\"enabled\":true}",
+                    first ? "" : ",", (unsigned)i, (unsigned)seg, (unsigned)(off & 0xFFFF));
+            else
+                snprintf(item, sizeof(item), "%s{\"id\":%u,\"type\":\"log\",\"address\":\"%04X:%04X\",\"stack_words\":%d,\"enabled\":true}",
+                    first ? "" : ",", (unsigned)i, (unsigned)seg, (unsigned)(off & 0xFFFF), it->second);
+        } else if (type == DEBUG_AI_BP_INTERRUPT) {
+            char ahs[8], als[8];
+            if (ah == 0x100) snprintf(ahs, sizeof(ahs), "null"); else snprintf(ahs, sizeof(ahs), "%u", (unsigned)ah);
+            if (al == 0x100) snprintf(als, sizeof(als), "null"); else snprintf(als, sizeof(als), "%u", (unsigned)al);
+            snprintf(item, sizeof(item), "%s{\"id\":%u,\"type\":\"interrupt\",\"int\":%u,\"ah\":%s,\"al\":%s,\"enabled\":true}",
+                first ? "" : ",", (unsigned)i, (unsigned)intNr, ahs, als);
+        } else if (type == DEBUG_AI_BP_MEMORY) {
+            snprintf(item, sizeof(item), "%s{\"id\":%u,\"type\":\"memory\",\"address\":\"%04X:%04X\",\"value\":\"%02X\",\"enabled\":true}",
+                first ? "" : ",", (unsigned)i, (unsigned)seg, (unsigned)(off & 0xFFFF), (unsigned)(ah & 0xFF));
+        } else if (type == DEBUG_AI_BP_MEMORY_LINEAR) {
+            snprintf(item, sizeof(item), "%s{\"id\":%u,\"type\":\"memory_linear\",\"linear\":\"%05X\",\"value\":\"%02X\",\"enabled\":true}",
+                first ? "" : ",", (unsigned)i, (unsigned)off, (unsigned)(ah & 0xFF));
+        } else {
+            snprintf(item, sizeof(item), "%s{\"id\":%u,\"type\":\"other\",\"enabled\":true}",
+                first ? "" : ",", (unsigned)i);
+        }
         arr += item;
         first = false;
     }
@@ -845,6 +922,148 @@ static std::string ExecBreakpointList(long long id) {
     return result;
 }
 
+/* ------------------------------------------------------------------ */
+/* Phase 6: memory / interrupt / logging breakpoints                    */
+/* ------------------------------------------------------------------ */
+
+void DEBUG_AI_NoteMemoryHit(uint16_t seg, uint32_t off, uint32_t linear,
+                            uint8_t oldValue, uint8_t newValue, bool isLinear) {
+    g_memHit.valid = true;
+    g_memHit.isLinear = isLinear;
+    g_memHit.seg = seg;
+    g_memHit.off = off;
+    g_memHit.linear = linear;
+    g_memHit.oldValue = oldValue;
+    g_memHit.newValue = newValue;
+}
+
+static std::string ExecBreakpointSetMemory(const AIRequestItem &item) {
+    std::string ids = "[", values = "[";
+    for (long long i = 0; i < item.memLength; i++) {
+        uint8_t current = 0;
+        int bpIndex = DEBUG_AI_MemBreakpointAdd(item.seg, item.off + (uint32_t)i, item.linear, current);
+        char buf[256];
+        if (bpIndex == -2) {
+            snprintf(buf, sizeof(buf),
+                "{\"id\":%lld,\"ok\":false,\"error\":{\"code\":\"NOT_SUPPORTED\","
+                "\"message\":\"memory breakpoints need a --enable-debug=heavy build\"}}", item.id);
+            return std::string(buf);
+        }
+        if (bpIndex < 0) {
+            snprintf(buf, sizeof(buf),
+                "{\"id\":%lld,\"ok\":false,\"error\":{\"code\":\"INTERNAL_ERROR\",\"message\":\"failed to create memory breakpoint\"}}",
+                item.id);
+            return std::string(buf);
+        }
+        char one[32];
+        /* Every add front-inserts, so earlier ids shift by one; report the
+         * ids as they stand after the last add. */
+        snprintf(one, sizeof(one), "%s\"%02X\"", i ? "," : "", (unsigned)current);
+        values += one;
+    }
+    for (long long i = 0; i < item.memLength; i++) {
+        char one[32];
+        snprintf(one, sizeof(one), "%s%lld", i ? "," : "", item.memLength - 1 - i);
+        ids += one;
+    }
+    ids += "]";
+    values += "]";
+    char head[128];
+    snprintf(head, sizeof(head), "{\"id\":%lld,\"ok\":true,\"result\":{\"ids\":", item.id);
+    return std::string(head) + ids + ",\"values\":" + values + "}}";
+}
+
+static std::string ExecBreakpointSetInterrupt(const AIRequestItem &item) {
+    int bpIndex = DEBUG_AI_IntBreakpointAdd(item.intNr, item.ah, item.al);
+    char buf[256];
+    if (bpIndex < 0) {
+        snprintf(buf, sizeof(buf),
+            "{\"id\":%lld,\"ok\":false,\"error\":{\"code\":\"INTERNAL_ERROR\",\"message\":\"failed to create interrupt breakpoint\"}}",
+            item.id);
+        return std::string(buf);
+    }
+    snprintf(buf, sizeof(buf), "{\"id\":%lld,\"ok\":true,\"result\":{\"id\":%d,\"int\":%u}}",
+        item.id, bpIndex, (unsigned)item.intNr);
+    return std::string(buf);
+}
+
+static std::string ExecBreakpointSetLog(const AIRequestItem &item) {
+    if (DEBUG_AI_BreakpointExists(item.seg, item.off)) {
+        char buf[320];
+        snprintf(buf, sizeof(buf),
+            "{\"id\":%lld,\"ok\":false,\"error\":{\"code\":\"BREAKPOINT_ALREADY_EXISTS\","
+            "\"message\":\"a breakpoint already exists at %04X:%04X\"}}",
+            item.id, (unsigned)item.seg, (unsigned)(item.off & 0xFFFF));
+        return std::string(buf);
+    }
+    int bpIndex = DEBUG_AI_BreakpointAdd(item.seg, item.off);
+    char buf[256];
+    if (bpIndex < 0) {
+        snprintf(buf, sizeof(buf),
+            "{\"id\":%lld,\"ok\":false,\"error\":{\"code\":\"INTERNAL_ERROR\",\"message\":\"failed to create breakpoint\"}}",
+            item.id);
+        return std::string(buf);
+    }
+    g_logBreakpoints[(uint32_t)GetAddress(item.seg, item.off)] = item.stackWords;
+    snprintf(buf, sizeof(buf),
+        "{\"id\":%lld,\"ok\":true,\"result\":{\"id\":%d,\"address\":\"%04X:%04X\",\"stack_words\":%d}}",
+        item.id, bpIndex, (unsigned)item.seg, (unsigned)(item.off & 0xFFFF), item.stackWords);
+    return std::string(buf);
+}
+
+/* If the debugger is stopped on a logging breakpoint, record one entry and
+ * resume through the same DEBUG_AI_DoContinue() as execution.continue.
+ * Emulator thread only (called from DEBUG_AI_Poll()). */
+static bool DEBUG_AI_LogAndResumeIfLogBreakpoint(void) {
+    if (g_logBreakpoints.empty() || DEBUG_AI_IsDebugRunning()) return false;
+    uint32_t here = (uint32_t)GetAddress(SegValue(cs), reg_eip);
+    auto it = g_logBreakpoints.find(here);
+    if (it == g_logBreakpoints.end()) return false;
+
+    std::string stack = "[";
+    for (int i = 0; i < it->second; i++) {
+        uint16_t w = mem_readw((PhysPt)GetAddress(SegValue(ss), (uint32_t)((reg_esp + 2u * (unsigned)i) & 0xFFFF)));
+        char one[16];
+        snprintf(one, sizeof(one), "%s\"%04X\"", i ? "," : "", (unsigned)w);
+        stack += one;
+    }
+    stack += "]";
+
+    {
+        std::lock_guard<std::mutex> lk(g_logMutex);
+        char head[128];
+        snprintf(head, sizeof(head), "{\"seq\":%llu,\"address\":\"%04X:%04X\",\"registers\":",
+            g_logSeq++, (unsigned)SegValue(cs), (unsigned)(reg_eip & 0xFFFF));
+        std::string entry = std::string(head) + BuildRegistersJson() + ",\"segments\":" +
+            BuildSegmentsJson() + ",\"stack\":" + stack + "}";
+        g_logEntries.push_back(entry);
+        while (g_logEntries.size() > MAX_LOG_ENTRIES) {
+            g_logEntries.pop_front();
+            g_logDropped++;
+        }
+    }
+    DEBUG_AI_DoContinue();
+    return true;
+}
+
+/* log.read runs on the socket thread: it only touches g_logEntries. */
+static std::string ReadLogEntries(long long id, long long max, bool clear) {
+    std::lock_guard<std::mutex> lk(g_logMutex);
+    std::string arr = "[";
+    long long n = 0;
+    for (auto it = g_logEntries.begin(); it != g_logEntries.end() && n < max; ++it, ++n) {
+        if (n) arr += ",";
+        arr += *it;
+    }
+    arr += "]";
+    if (clear) g_logEntries.erase(g_logEntries.begin(), g_logEntries.begin() + (long)n);
+    char head[128];
+    snprintf(head, sizeof(head), "{\"id\":%lld,\"ok\":true,\"result\":{\"entries\":", id);
+    char tail[128];
+    snprintf(tail, sizeof(tail), ",\"remaining\":%u,\"dropped\":%llu}}", (unsigned)g_logEntries.size(), g_logDropped);
+    return std::string(head) + arr + tail;
+}
+
 static std::string ExecuteRequest(const AIRequestItem &item) {
     switch (item.method) {
         case AIMethod::DebugStatus:      return ExecDebugStatus(item.id);
@@ -857,6 +1076,9 @@ static std::string ExecuteRequest(const AIRequestItem &item) {
         case AIMethod::BreakpointSet:     return ExecBreakpointSet(item.id, item.seg, item.off);
         case AIMethod::BreakpointDelete:  return ExecBreakpointDelete(item.id, item.breakpointIndex);
         case AIMethod::BreakpointList:    return ExecBreakpointList(item.id);
+        case AIMethod::BreakpointSetMemory:    return ExecBreakpointSetMemory(item);
+        case AIMethod::BreakpointSetInterrupt: return ExecBreakpointSetInterrupt(item);
+        case AIMethod::BreakpointSetLog:       return ExecBreakpointSetLog(item);
         case AIMethod::ExecutionContinue: return ExecExecutionContinue(item.id);
         case AIMethod::ExecutionStepInto: return ExecExecutionStepInto(item.id);
         case AIMethod::ExecutionStepOver: return ExecExecutionStepOver(item);
@@ -867,6 +1089,11 @@ static std::string ExecuteRequest(const AIRequestItem &item) {
 }
 
 void DEBUG_AI_Poll(void) {
+    /* Phase 6: a logging breakpoint never hands the stop to a client. Once
+     * resumed, leave queued requests for the next real stop -- serving them
+     * now would read state that is already running again. */
+    if (DEBUG_AI_LogAndResumeIfLogBreakpoint()) return;
+
     for (;;) {
         AIRequestItem item;
         {
@@ -1203,6 +1430,108 @@ static void HandleLine(const std::shared_ptr<AIConnection> &conn, const std::str
             RespondError("INVALID_PARAMETER", "params.id out of range"); return;
         }
         item.breakpointIndex = bpIndex;
+    } else if (method == "breakpoint.set_memory") {
+        /* Phase 6 */
+        item.method = AIMethod::BreakpointSetMemory;
+        if (!params) { RespondError("INVALID_PARAMETER", "breakpoint.set_memory requires \"params\""); return; }
+        auto itAddr = params->object.find("address");
+        auto itLin = params->object.find("linear");
+        bool hasAddr = itAddr != params->object.end() && itAddr->second.type == JsonValue::Type::String;
+        bool hasLin = itLin != params->object.end() && itLin->second.type == JsonValue::Type::String;
+        if (hasAddr == hasLin) {
+            RespondError("INVALID_PARAMETER", "give exactly one of params.address (\"SEG:OFF\") or params.linear (hex)"); return;
+        }
+        if (hasAddr) {
+            if (!ParseAddress(itAddr->second.str, item.seg, item.off)) {
+                RespondError("INVALID_ADDRESS", "malformed address, expected \"SEG:OFF\" hex"); return;
+            }
+        } else {
+            const std::string &lin = itLin->second.str;
+            char *endp = nullptr;
+            unsigned long v = strtoul(lin.c_str(), &endp, 16);
+            if (lin.empty() || endp == lin.c_str() || *endp != '\0' || v > 0xFFFFFFFFul) {
+                RespondError("INVALID_ADDRESS", "params.linear must be a hex string"); return;
+            }
+            item.linear = true;
+            item.seg = 0;
+            item.off = (uint32_t)v;
+        }
+        auto itLen = params->object.find("length");
+        if (itLen != params->object.end()) {
+            if (itLen->second.type != JsonValue::Type::Number) {
+                RespondError("INVALID_PARAMETER", "params.length must be a number"); return;
+            }
+            item.memLength = (long long)itLen->second.number;
+        }
+        if (item.memLength < 1 || item.memLength > 16) {
+            RespondError("INVALID_PARAMETER", "params.length must be 1-16"); return;
+        }
+    } else if (method == "breakpoint.set_interrupt") {
+        /* Phase 6 */
+        item.method = AIMethod::BreakpointSetInterrupt;
+        if (!params) { RespondError("INVALID_PARAMETER", "breakpoint.set_interrupt requires \"params\""); return; }
+        auto itInt = params->object.find("int");
+        if (itInt == params->object.end() || itInt->second.type != JsonValue::Type::Number ||
+            itInt->second.number < 0 || itInt->second.number > 255) {
+            RespondError("INVALID_PARAMETER", "params.int must be a number 0-255"); return;
+        }
+        item.intNr = (uint8_t)itInt->second.number;
+        for (const char *key : {"ah", "al"}) {
+            auto it = params->object.find(key);
+            if (it == params->object.end() || it->second.type == JsonValue::Type::Null) continue;
+            if (it->second.type != JsonValue::Type::Number || it->second.number < 0 || it->second.number > 255) {
+                RespondError("INVALID_PARAMETER", std::string("params.") + key + " must be a number 0-255 or null"); return;
+            }
+            if (key[1] == 'h') item.ah = (uint16_t)it->second.number;
+            else item.al = (uint16_t)it->second.number;
+        }
+        if (item.ah == 0x100 && item.al != 0x100) {
+            RespondError("INVALID_PARAMETER", "params.al needs params.ah"); return;
+        }
+    } else if (method == "breakpoint.set_log") {
+        /* Phase 6 */
+        item.method = AIMethod::BreakpointSetLog;
+        if (!params) { RespondError("INVALID_PARAMETER", "breakpoint.set_log requires \"params\""); return; }
+        auto itAddr = params->object.find("address");
+        if (itAddr == params->object.end() || itAddr->second.type != JsonValue::Type::String) {
+            RespondError("INVALID_PARAMETER", "params.address must be a string"); return;
+        }
+        if (!ParseAddress(itAddr->second.str, item.seg, item.off)) {
+            RespondError("INVALID_ADDRESS", "malformed address, expected \"SEG:OFF\" hex"); return;
+        }
+        auto itWords = params->object.find("stack_words");
+        if (itWords != params->object.end()) {
+            if (itWords->second.type != JsonValue::Type::Number) {
+                RespondError("INVALID_PARAMETER", "params.stack_words must be a number"); return;
+            }
+            item.stackWords = (int)itWords->second.number;
+        }
+        if (item.stackWords < 0 || item.stackWords > 32) {
+            RespondError("INVALID_PARAMETER", "params.stack_words must be 0-32"); return;
+        }
+    } else if (method == "log.read") {
+        /* Phase 6: bridge-owned buffer, answered here without the emulator
+         * thread so it also works while the guest runs. */
+        long long maxEntries = 1000;
+        bool clear = true;
+        if (params) {
+            auto itMax = params->object.find("max");
+            if (itMax != params->object.end()) {
+                if (itMax->second.type != JsonValue::Type::Number || itMax->second.number < 1 || itMax->second.number > (double)MAX_LOG_ENTRIES) {
+                    RespondError("INVALID_PARAMETER", "params.max must be 1-4096"); return;
+                }
+                maxEntries = (long long)itMax->second.number;
+            }
+            auto itClear = params->object.find("clear");
+            if (itClear != params->object.end()) {
+                if (itClear->second.type != JsonValue::Type::Bool) {
+                    RespondError("INVALID_PARAMETER", "params.clear must be a boolean"); return;
+                }
+                clear = itClear->second.number != 0;
+            }
+        }
+        SendLine(conn, ReadLogEntries(id, maxEntries, clear));
+        return;
     } else if (method == "breakpoint.list") {
         item.method = AIMethod::BreakpointList;
     } else {

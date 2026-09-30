@@ -112,6 +112,25 @@ bool DEBUG_AI_BreakpointExists(uint16_t seg, uint32_t off);
 int DEBUG_AI_BreakpointAdd(uint16_t seg, uint32_t off);
 bool DEBUG_AI_BreakpointDelete(uint16_t index);
 
+/* Phase 6: memory / interrupt breakpoints and the memory-hit record.   */
+/* Thin wrappers around CBreakpoint's existing AddMemBreakpoint()/      */
+/* AddIntBreakpoint(); see docs/phase6-watch-int-log-breakpoints.md.    */
+enum {
+    DEBUG_AI_BP_PHYSICAL = 0,
+    DEBUG_AI_BP_INTERRUPT = 1,
+    DEBUG_AI_BP_MEMORY = 2,
+    DEBUG_AI_BP_MEMORY_LINEAR = 3,
+    DEBUG_AI_BP_OTHER = 4
+};
+bool DEBUG_AI_BreakpointDetail(uint16_t index, int &type, uint16_t &seg, uint32_t &off,
+                               uint8_t &intNr, uint16_t &ah, uint16_t &al);
+/* Returns the new index, -1 on failure, -2 when the build lacks C_HEAVY_DEBUG. */
+int DEBUG_AI_MemBreakpointAdd(uint16_t seg, uint32_t off, bool linear, uint8_t &current);
+int DEBUG_AI_IntBreakpointAdd(uint8_t intNr, uint16_t ah, uint16_t al);
+/* Called by CBreakpoint::CheckBreakpoint() when a memory breakpoint fires. */
+void DEBUG_AI_NoteMemoryHit(uint16_t seg, uint32_t off, uint32_t linear,
+                            uint8_t oldValue, uint8_t newValue, bool isLinear);
+
 /* ------------------------------------------------------------------ */
 /* Execution control (Phase 4C)                                        */
 /*                                                                      */

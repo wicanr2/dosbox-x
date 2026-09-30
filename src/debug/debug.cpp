@@ -797,6 +797,7 @@ bool CBreakpoint::CheckBreakpoint(uint16_t seg, uint32_t off)
                         return false;
                     }
 					DEBUG_ShowMsg("DEBUG: Memory breakpoint %s: %04X:%04X - %02X -> %02X\n",(bp->GetType()==BKPNT_MEMORY_PROT)?"(Prot)":"",bp->GetSegment(),bp->GetOffset(),bp->GetValue(),value);
+					DEBUG_AI_NoteMemoryHit(bp->GetSegment(),bp->GetOffset(),(uint32_t)address,(uint8_t)bp->GetValue(),value,bp->GetType()==BKPNT_MEMORY_LINEAR);
 					bp->SetValue(value);
 					return true;
 				}
@@ -995,6 +996,59 @@ int DEBUG_AI_BreakpointAdd(uint16_t seg, uint32_t off) {
 		if (CBreakpoint::GetByIndex(i) == bp) return (int)i;
 	}
 	return -1; // should not happen -- AddBreakpoint() always inserts into BPoints
+}
+
+/* Phase 6 (docs/phase6-watch-int-log-breakpoints.md). */
+static int DEBUG_AI_IndexOf(CBreakpoint *bp) {
+	uint16_t count = CBreakpoint::GetCount();
+	for (uint16_t i = 0; i < count; i++) {
+		if (CBreakpoint::GetByIndex(i) == bp) return (int)i;
+	}
+	return -1;
+}
+
+bool DEBUG_AI_BreakpointDetail(uint16_t index, int &type, uint16_t &seg, uint32_t &off,
+                               uint8_t &intNr, uint16_t &ah, uint16_t &al) {
+	CBreakpoint *bp = CBreakpoint::GetByIndex(index);
+	if (!bp) return false;
+	switch (bp->GetType()) {
+	case BKPNT_PHYSICAL:      type = DEBUG_AI_BP_PHYSICAL; break;
+	case BKPNT_INTERRUPT:     type = DEBUG_AI_BP_INTERRUPT; break;
+	case BKPNT_MEMORY:        type = DEBUG_AI_BP_MEMORY; break;
+	case BKPNT_MEMORY_LINEAR: type = DEBUG_AI_BP_MEMORY_LINEAR; break;
+	default:                  type = DEBUG_AI_BP_OTHER; break;
+	}
+	seg = bp->GetSegment();
+	off = bp->GetOffset();
+	intNr = bp->GetIntNr();
+	ah = bp->GetValue();
+	al = bp->GetOther();
+	return true;
+}
+
+int DEBUG_AI_MemBreakpointAdd(uint16_t seg, uint32_t off, bool linear, uint8_t &current) {
+#if C_HEAVY_DEBUG
+	CBreakpoint *bp = CBreakpoint::AddMemBreakpoint(linear ? 0 : seg, off);
+	if (!bp) return -1;
+	if (linear) bp->SetType(BKPNT_MEMORY_LINEAR);
+	/* Start from the byte's current value: the GUI's BPM starts from 0 and
+	 * fires once on the first check for any non-zero byte. */
+	PhysPt address = linear ? (PhysPt)off : (PhysPt)GetAddress(seg, off);
+	uint8_t value = 0;
+	if (mem_readb_checked(address, &value)) value = 0;
+	bp->SetValue(value);
+	current = value;
+	return DEBUG_AI_IndexOf(bp);
+#else
+	(void)seg; (void)off; (void)linear; (void)current;
+	return -2;
+#endif
+}
+
+int DEBUG_AI_IntBreakpointAdd(uint8_t intNr, uint16_t ah, uint16_t al) {
+	CBreakpoint *bp = CBreakpoint::AddIntBreakpoint(intNr, ah, al, false);
+	if (!bp) return -1;
+	return DEBUG_AI_IndexOf(bp);
 }
 
 bool DEBUG_AI_BreakpointDelete(uint16_t index) {
